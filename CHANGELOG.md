@@ -2,6 +2,8 @@
 
 ## 1.0.0 — Unreleased
 
+- Added on-chain registration confirmation reconciliation (`POST /api/proofs/reconcile`, worker `verify_tx` handling, Horizon confirmation-depth policy). See `backend/docs/registration-reconciliation.md`.
+
 - Added a CI end-to-end environment matrix (`devx/e2e_env_matrix.py`) that exercises public API boundaries across development/testing/production-like profiles with privacy-safe failure checks.
 
 - Added an atomic compatibility manifest and release gate spanning frontend,
