@@ -20,6 +20,8 @@ from envelope import canonical_metadata_hash
 from stego import embed_metadata, extract_metadata, sha256_file
 from noir import generate_silent_witness
 from app import safe_filename, redact_metadata
+from app import normalize_filename, redact_metadata
+from config import load_config
 
 from storage import get_job_input_path, get_job_output_path
 from tx_verification import verify_transaction_status
@@ -59,7 +61,7 @@ def process_embed(job: dict) -> dict:
     
     db_event = insert_proof_event(
         event_type="embed",
-        file_name=safe_filename(filename),
+        file_name=normalize_filename(filename),
         video_hash=embedded_hash,
         metadata_hash=metadata_hash,
         proof_id=metadata.get("proofId"),
@@ -93,7 +95,7 @@ def process_extract(job: dict) -> dict:
     
     db_event = insert_proof_event(
         event_type="extract",
-        file_name=safe_filename(filename),
+        file_name=normalize_filename(filename),
         video_hash=video_hash,
         metadata_hash=metadata_hash,
         proof_id=metadata.get("proofId") if metadata else None,
