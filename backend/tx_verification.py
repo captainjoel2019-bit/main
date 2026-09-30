@@ -7,8 +7,13 @@ import logging
 import os
 import urllib.error
 import urllib.request
-from dataclasses import asdict, dataclass
-from typing import Any
+
+from fetch_external import (
+    FetchTimeoutError,
+    ResponseTooLargeError,
+    safe_urlopen,
+)
+from tracing import traced
 
 LOGGER = logging.getLogger("harpocrates.tx_verification")
 if not LOGGER.handlers:
@@ -27,96 +32,11 @@ TERMINAL_STATUSES = frozenset({"confirmed", "failed", "missing"})
 ALLOWED_STATUSES = frozenset({"pending", "confirmed", "failed", "missing", "error"})
 
 
-@dataclass(frozen=True)
-class TxVerificationResult:
-    """Privacy-safe verification outcome (no envelopes, media, or secrets)."""
-
-    status: str
-    ledger: int | None = None
-    latest_ledger: int | None = None
-    confirmations: int | None = None
-    successful: bool | None = None
-    source: str | None = None
-    reason: str | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
-def horizon_urls() -> list[str]:
-    raw = os.getenv("HORIZON_URLS", "").strip()
-    if raw:
-        urls = [item.strip().rstrip("/") for item in raw.split(",") if item.strip()]
-        if urls:
-            return urls
-    return list(_DEFAULT_RPC_URLS)
-
-
-# Back-compat alias used by older worker code.
-RPC_URLS = list(_DEFAULT_RPC_URLS)
-
-
-def _is_hex_32(value: str) -> bool:
-    if len(value) != 64:
-        return False
-    try:
-        int(value, 16)
-    except ValueError:
-        return False
-    return True
-
-
-def normalize_tx_hash(value: object) -> str:
-    """Normalize a Stellar transaction hash to lowercase 32-byte hex."""
-    if not isinstance(value, str):
-        raise ValueError("txHash must be a 32-byte hex string")
-    normalized = value.strip().lower()
-    if normalized.startswith("0x"):
-        normalized = normalized[2:]
-    if not _is_hex_32(normalized):
-        raise ValueError("txHash must be a 32-byte hex string")
-    return normalized
-
-
-def _short_hash(tx_hash: str) -> str:
-    return tx_hash[:8]
-
-
-def _fetch_json(url: str, timeout: float = 10.0) -> tuple[int, dict[str, Any] | None]:
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            body = response.read().decode("utf-8")
-            if not body:
-                return response.status, None
-            data = json.loads(body)
-            if not isinstance(data, dict):
-                return response.status, None
-            return response.status, data
-    except urllib.error.HTTPError as exc:
-        try:
-            payload = exc.read().decode("utf-8")
-            data = json.loads(payload) if payload else None
-        except Exception:
-            data = None
-        return exc.code, data if isinstance(data, dict) else None
-
-
-def _latest_ledger(rpc_url: str, timeout: float = 10.0) -> int | None:
-    status, data = _fetch_json(f"{rpc_url}/ledgers?order=desc&limit=1", timeout=timeout)
-    if status != 200 or not data:
-        return None
-    records = (data.get("_embedded") or {}).get("records") or []
-    if not records:
-        return None
-    sequence = records[0].get("sequence")
-    try:
-        return int(sequence)
-    except (TypeError, ValueError):
-        return None
-
-
-def verify_transaction(
+@traced(
+    "stellar.horizon.verify_transaction",
+    attributes={"rpc.system": "stellar", "peer.service": "stellar-horizon"},
+)
+def verify_transaction_status(
     tx_hash: str,
     *,
     min_confirmations: int = 1,

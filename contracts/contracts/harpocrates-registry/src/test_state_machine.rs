@@ -44,7 +44,7 @@ struct MockStateMachineVerifier;
 impl MockStateMachineVerifier {
     pub fn verify_proof(_env: Env, public_inputs: Bytes, proof: Bytes) {
         let len = public_inputs.len();
-        if !(matches!(len, 128 | 160 | 224)) || proof.is_empty() {
+        if !(matches!(len, 128 | 160 | 224 | 256)) || proof.is_empty() {
             panic!("invalid state-machine proof");
         }
     }
@@ -1495,7 +1495,7 @@ fn assert_storage_matches_model(fixture: &Fixture, model: &Model) -> CheckResult
     }
 
     for nullifier in 0..KEY_POOL {
-        let actual = client.has_nullifier(&key(&fixture.env, HashDomain::Nullifier, nullifier));
+        let actual = client.has_nullifier(&client.get_verifier().unwrap(), &key(&fixture.env, HashDomain::Nullifier, nullifier));
         let expected = model.nullifier_exists(nullifier);
         if actual != expected {
             return Err(format!(

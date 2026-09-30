@@ -41,6 +41,7 @@ from errors import (
     NOT_FOUND,
     PAYLOAD_TOO_LARGE,
     RATE_LIMITED,
+    UNSUPPORTED_MEDIA_TYPE,
     VALIDATION_ERROR,
     error_response,
 )
@@ -93,6 +94,7 @@ from metadata_errors import (
     metadata_error_response,
 )
 from schema import discover_schemas, resolve_schema, validate_selective_disclosure_input
+from verification_receipt import build_verification_receipt
 from stego import canonical_metadata_hash, embed_metadata, extract_metadata, sha256_file
 from c2pa import (
     C2paParseError,
@@ -116,10 +118,16 @@ from trace_fields import (
     format_traceparent,
     merge_trace_into_event,
 )
+from tracing import (
+    begin_request_span,
+    configure_tracing,
+    finish_request_span,
+)
 from readiness import ReadinessManager
+from verifier_cache import VerifierCache
 from admission import AdmissionController, require_capacity
 from webhook import WebhookWorker, queue_webhook_deliveries
-from quarantine import QuarantineError, isolate_upload
+from quarantine import QuarantineError, isolate_upload, sniff_media_type_stream, sniff_media_type_path
 from strkey import validate_source_address, validate_contract_id
 from streaming_upload import (
     StreamingFileStorage,
@@ -142,6 +150,32 @@ if not LOGGER.handlers:
     LOGGER.addHandler(handler)
 LOGGER.setLevel(logging.INFO)
 LOGGER.propagate = False
+
+# ---------------------------------------------------------------------------
+# Declared upload-body budget
+# ---------------------------------------------------------------------------
+# A ``multipart/form-data`` upload carries framing bytes (boundaries, part
+# headers, and the small metadata part) on top of the video/chunk payload, so
+# the declared ``Content-Length`` budget allows a fixed overhead on top of the
+# per-file budget.  Without this allowance a payload sitting exactly on
+# ``MAX_VIDEO_BYTES`` would be rejected purely because of framing.
+UPLOAD_MULTIPART_OVERHEAD_BYTES = 1_048_576
+
+
+def declared_upload_limit_bytes(config) -> int:
+    """Return the largest acceptable declared ``Content-Length`` for an upload.
+
+    The per-file budget is ``UPLOAD_MAX_BYTES`` when the deployment sets it,
+    otherwise ``MAX_VIDEO_BYTES``; multipart framing is permitted on top of it.
+    The whole body must still fit under ``MAX_CONTENT_LENGTH`` when that cap is
+    the lower of the two, so the effective limit is the minimum of the two.
+    """
+    per_file = int(getattr(config, "upload_max_bytes", 0) or config.max_video_bytes)
+    limit = per_file + UPLOAD_MULTIPART_OVERHEAD_BYTES
+    global_cap = int(getattr(config, "max_content_length", 0) or 0)
+    if global_cap and limit > global_cap:
+        limit = global_cap
+    return limit
 
 
 def _make_key_func(config):
@@ -189,7 +223,20 @@ def _make_key_func(config):
 def create_app() -> Flask:
     load_dotenv()
     config = load_config()
+    configure_tracing(
+        enabled=config.tracing_enabled,
+        service_name=config.tracing_service_name,
+        endpoint=config.tracing_endpoint,
+        sample_ratio=config.tracing_sample_ratio,
+        export_timeout_seconds=config.tracing_export_timeout_seconds,
+        service_version=config.release_id,
+    )
     app = Flask(__name__)
+    app.extensions["verifier_cache"] = VerifierCache(
+        max_size=config.verifier_cache_max_size,
+        positive_ttl_seconds=config.verifier_cache_positive_ttl_seconds,
+        negative_ttl_seconds=config.verifier_cache_negative_ttl_seconds,
+    )
     CORS(app, **cors_kwargs(config.cors_origins))
     app.config["MAX_CONTENT_LENGTH"] = config.max_content_length
     # Propagate the request id through every response (header + JSON body).
@@ -234,6 +281,28 @@ def create_app() -> Flask:
         g.start_time = time.perf_counter()
         g.request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
         g.request_started_at = time.perf_counter()
+
+    @app.before_request
+    def initialize_trace_context():
+        g.trace_fields = build_trace_fields(
+            request.headers,
+            request_id=g.request_id,
+            method=request.method,
+            route=request.url_rule.rule if request.url_rule else request.path,
+            path=request.path,
+        )
+        g.request_id = g.trace_fields["request_id"]
+        g.otel_request_span = begin_request_span(
+            request.headers,
+            method=request.method,
+            route=request.url_rule.rule if request.url_rule else g.trace_fields["endpoint_pattern"],
+            request_id=g.request_id,
+        )
+        span_context = g.otel_request_span.span.get_span_context()
+        if span_context.is_valid:
+            g.trace_fields["trace_id"] = f"{span_context.trace_id:032x}"
+            g.trace_fields["span_id"] = f"{span_context.span_id:016x}"
+            g.trace_fields["trace_flags"] = f"{int(span_context.trace_flags):02x}"
 
     @app.before_request
     def enforce_cors_origins():
@@ -281,17 +350,6 @@ def create_app() -> Flask:
             message="request origin is not allowed",
             status=403,
         )
-        # Privacy-safe trace fields for log correlation (no secrets/media/PII).
-        g.trace_fields = build_trace_fields(
-            request.headers,
-            request_id=g.request_id,
-            method=request.method,
-            route=request.url_rule.rule if request.url_rule else request.path,
-            path=request.path,
-        )
-        # Keep request_id aligned with normalized opaque ID from trace builder.
-        g.request_id = g.trace_fields["request_id"]
-
     @app.after_request
     def process_response(response: Response):
         # X-Request-ID and the body-level request_id are applied by the
@@ -343,7 +401,20 @@ def create_app() -> Flask:
                 trace,
             ),
         )
+        finish_request_span(
+            getattr(g, "otel_request_span", None),
+            status_code=response.status_code,
+        )
         return response
+
+    @app.teardown_request
+    def finish_unhandled_request_span(error: BaseException | None):
+        if getattr(g, "otel_request_span", None) is not None:
+            finish_request_span(
+                g.otel_request_span,
+                status_code=500 if error is not None else 200,
+                error=error,
+            )
 
     def require_register_auth(fn):
         """Decorator that enforces ownership-scoped auth on proof registration.
@@ -659,7 +730,11 @@ def create_app() -> Flask:
                 embedded_hash = workspace.sha256("embedded.mp4")
                 metadata_hash = canonical_metadata_hash(metadata)
         except QuarantineError as exc:
-            return jsonify({"error": str(exc)}), 400
+            return error_response(
+                code=UNSUPPORTED_MEDIA_TYPE,
+                message=str(exc),
+                status=400,
+            )
 
         db_event = insert_proof_event(
             event_type="embed",
@@ -763,6 +838,16 @@ def create_app() -> Flask:
             max_size=getattr(config, "upload_max_bytes", config.max_video_bytes),
         )
 
+        # Sniff assembled file before handing it to ffmpeg.
+        try:
+            sniff_media_type_path(combined_path)
+        except QuarantineError as exc:
+            return error_response(
+                code=UNSUPPORTED_MEDIA_TYPE,
+                message=str(exc),
+                status=400,
+            )
+
         with tempfile.TemporaryDirectory(prefix="harpocrates-") as tmp_dir:
             output_path = Path(tmp_dir) / "embedded.mp4"
             embed_metadata(combined_path, output_path, metadata)
@@ -842,7 +927,11 @@ def create_app() -> Flask:
                 video_hash = workspace.sha256("source.video")
                 metadata_hash = canonical_metadata_hash(metadata) if metadata else None
         except QuarantineError as exc:
-            return jsonify({"error": str(exc)}), 400
+            return error_response(
+                code=UNSUPPORTED_MEDIA_TYPE,
+                message=str(exc),
+                status=400,
+            )
 
         retention_class = request.headers.get("X-Harpocrates-Retention-Class") or (metadata.get("retentionClass", "default") if metadata else "default")
         if retention_class not in config.retention_classes:
@@ -978,6 +1067,73 @@ def create_app() -> Flask:
             return jsonify({"error": "failed to record lineage event"}), 500
 
         return jsonify({"ok": True, "manifestDigest": manifest_digest, "db_event": db_event})
+
+    @app.post("/api/proofs/verify-batch")
+    @require_capacity(admission_controller)
+    def verify_batch():
+        if _enforce_json_size() > config.max_json_bytes:
+            return jsonify({"error": "JSON payload exceeds size limit"}), 413
+
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict) or not isinstance(payload.get("proofs"), list):
+            return jsonify({"error": "JSON body with a 'proofs' array is required"}), 400
+
+        proofs = payload["proofs"]
+        if len(proofs) > config.max_batch_size:
+            return jsonify({"error": f"batch size exceeds limit of {config.max_batch_size}"}), 413
+
+        results = []
+        for idx, item in enumerate(proofs):
+            if not isinstance(item, dict):
+                results.append({"status": "malformed", "error": "item must be a JSON object", "index": idx})
+                continue
+            
+            video_hash = item.get("videoHash")
+            proof_id = item.get("proofId")
+            
+            if video_hash is not None and not is_hex_32(video_hash):
+                results.append({"videoHash": video_hash, "proofId": proof_id, "status": "malformed", "error": "invalid videoHash", "index": idx})
+                continue
+            if proof_id is not None and not is_hex_32(proof_id):
+                results.append({"videoHash": video_hash, "proofId": proof_id, "status": "malformed", "error": "invalid proofId", "index": idx})
+                continue
+            if not video_hash and not proof_id:
+                results.append({"status": "malformed", "error": "must provide videoHash or proofId", "index": idx})
+                continue
+
+            try:
+                events = []
+                if video_hash:
+                    events = find_proof_events_by_video(video_hash)
+                    if proof_id:
+                        events = [e for e in events if e.get("proof_id") == proof_id]
+                else:
+                    events = find_proof_events_by_proof_id(proof_id)
+                
+                if not events:
+                    results.append({"videoHash": video_hash, "proofId": proof_id, "status": "not_found", "events": [], "index": idx})
+                else:
+                    # Determine status from db events.
+                    # Since on-chain revocation isn't visible here, we use tx_status if available.
+                    has_confirmed = any(e.get("tx_status") == "confirmed" for e in events)
+                    has_failed = any(e.get("tx_status") == "failed" for e in events)
+                    has_revoked = any(e.get("tx_status") == "revoked" for e in events)  # Future compat
+                    
+                    if has_revoked:
+                        status = "revoked"
+                    elif has_confirmed:
+                        status = "verified"
+                    elif has_failed:
+                        status = "failed"
+                    else:
+                        status = "pending"
+                        
+                    results.append({"videoHash": video_hash, "proofId": proof_id, "status": status, "events": events, "index": idx})
+            except Exception as e:
+                # Catch dependency failure (e.g. database down) gracefully for the batch item
+                results.append({"videoHash": video_hash, "proofId": proof_id, "status": "dependency_failure", "error": str(e), "index": idx})
+
+        return jsonify({"ok": True, "results": results})
 
     @app.post("/api/proofs/register")
     @limiter.limit(config.ratelimit_register)
@@ -1127,6 +1283,10 @@ def create_app() -> Flask:
             }), 409
 
         if db_event and db_event.get("id") and created:
+            # A newly registered proof can change the on-chain verification
+            # result. Evict all cached results for this proof before clients
+            # perform the next verification lookup.
+            app.extensions["verifier_cache"].invalidate_proof(proof_id)
             queue_webhook_deliveries(db_event["id"])
             if normalized_tx_hash:
                 enqueue_job("verify_tx", {"proof_id": proof_id, "tx_hash": normalized_tx_hash, "contract_id": validated_contract_id})
@@ -1480,7 +1640,8 @@ def create_app() -> Flask:
         job = get_job(job_id)
         if not job:
             return jsonify({"error": "Job not found"}), 404
-        return jsonify({"ok": True, "job": job})
+        public_job = {key: value for key, value in job.items() if key != "_trace_context"}
+        return jsonify({"ok": True, "job": public_job})
 
     @app.get("/api/jobs/<int:job_id>/download")
     def download_job_result(job_id: int):
@@ -1623,11 +1784,20 @@ def create_app() -> Flask:
         if err is not None:
             return jsonify({"error": err}), 400
 
-        return jsonify({
+        response = {
             "ok": True,
             "message": "Selective disclosure proof submission accepted.",
             "note": "On-chain verification must be performed via verify_selective_disclosure on the registry contract.",
-        })
+        }
+        receipt_context = payload.get("receiptContext")
+        if receipt_context is not None:
+            if not isinstance(receipt_context, dict):
+                return jsonify({"error": "receiptContext must be a JSON object"}), 400
+            try:
+                response["verificationReceipt"] = build_verification_receipt(receipt_context)
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
+        return jsonify(response)
 
     # -----------------------------------------------------------------------
     # C2PA interoperability
@@ -1966,11 +2136,40 @@ def is_field_decimal(value: object) -> bool:
 
 
 def validate_video_upload(video) -> None:
+    """Validate an uploaded video *before* it is saved to disk or handed to ffmpeg.
+
+    Checks (in order):
+    1. Filename is present.
+    2. Declared ``Content-Type`` is in the ``video/*`` family or the generic
+       ``application/octet-stream`` wildcard.
+    3. **Media-type sniff** — reads the first 32 bytes of the upload stream and
+       verifies that a recognised video magic signature is present and consistent
+       with both the filename extension and the declared content type.  The stream
+       is rewound to offset 0 after the read so subsequent ``save()`` calls are
+       unaffected.
+
+    Raises :class:`QuarantineError` (a ``ValueError`` subclass) on any failure so
+    the existing ``except ValueError`` / ``except QuarantineError`` call sites keep
+    working unchanged.
+    """
     if not video.filename:
         raise ValueError("video filename is required")
+
     content_type = (video.content_type or "").lower()
     if content_type and not content_type.startswith("video/") and content_type != "application/octet-stream":
-        raise ValueError("video upload must use a video content type")
+        raise QuarantineError("video upload must use a video/* or application/octet-stream content type")
+
+    # Stream-level magic-byte sniff: detects mismatches between declared type
+    # and actual file contents before the file is persisted anywhere.
+    stream = getattr(video, "stream", None)
+    if stream is None:
+        # Fallback for duck-typed objects (e.g. test stubs) that expose .read()
+        stream = video
+    sniff_media_type_stream(
+        stream,
+        filename=video.filename,
+        content_type=video.content_type,
+    )
 
 
 

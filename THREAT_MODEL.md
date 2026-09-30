@@ -112,6 +112,7 @@ Each assumption is a potential attack surface if violated.
 | D7 | Circuit artifacts in `frontend/public/noir/` match the circuit used to generate `RegistryWasmHash`-era verifier keys. | Browser-generated proofs fail on-chain verification or (worse) a stale verifier accepts proofs from a replaced circuit. |
 | D8 | Stellar Testnet ledger timestamps are monotonically increasing and not manipulable by a single validator. | Proof TTL enforcement can be bypassed. |
 | D9 | ffmpeg/ffprobe binaries on the backend host are from a trusted, unmodified distribution. | Malicious ffmpeg could exfiltrate video frames or corrupt steganographic output. |
+| D10 | Deployment containers execute as dedicated unprivileged non-root users (`harpocrates` UID 10001 for backend, `nginx` UID 101 for frontend) with `no-new-privileges:true`. | Vulnerability in runtime dependencies (e.g. ffmpeg or nginx parser) could lead to container breakout or host root compromise. |
 
 
 ---
@@ -273,6 +274,22 @@ circuit is fixed at this depth; host tooling (`zk/tools/revocation_depth.py`,
 verifier codec) rejects oversized depth before proving so hostile trees cannot
 inflate witness size or proving cost at this boundary. Depth changes require a
 new circuit version.
+
+**Control (#323):** Issuer rotation is explicit and bounded. `rotate_issuer`
+retires the previous issuer key immediately — it can no longer sign new seals,
+directly or through a delegation — and opens a grace window defaulting to
+`DEFAULT_ISSUER_ROTATION_GRACE_SECS` (90 days) and capped at
+`MAX_ISSUER_ROTATION_GRACE_SECS` (365 days); a longer or overflowing request, and
+a rotation that names the same key twice, fail closed. During the window
+`is_issuer_verifiable(previous)` stays true so pre-rotation seals keep a
+defensible endorsement, and at `grace_expires_at` it fails closed, so a retired
+key can never hold standing indefinitely. `revoke_issuer`, the timelocked
+`RevokeIssuer` action, and `add_issuer` all clear the rotation record, so
+compromise response and re-onboarding are never shadowed by a grace window.
+Typed `IssuerRotated` / `IssuerRotationGraceExpired` events carry addresses,
+ledger time, and the window bound only — no key material, metadata preimages,
+witnesses, media, or reasons. The window is stored under the additive
+`DataKey::IssuerRotation` key, so pre-#323 deployments read as "no rotation".
 
 **Residual risk:** Revocation is reactive, not proactive. Records registered
 before revocation remain `STATUS_REGISTERED` on-chain. The admin must manually
@@ -474,6 +491,9 @@ limitation).
 | `credential_root` extracted from public inputs must be in the active allowlist | `lib.rs` → `require_active_credential_root` |
 | Nullifier from public inputs is stored and replay-checked | `lib.rs` → `DuplicateNullifier` |
 | Circuit enforces `derived_root == credential_root` and `derived_nullifier == nullifier` | `silent_witness/src/main.nr` |
+| Circuit asserts its committed `circuit_version` equals `CURRENT_CIRCUIT_VERSION`, so a proof cannot claim a circuit other than the one that produced it | `silent_witness/src/main.nr` → `test_circuit_version_downgrade` |
+| `silent_witness/v2` (`hpx-vi/2`) re-checks that committed version at every verifier boundary, before the identity fields, and rejects a mismatch with a stable code | `verifier_inputs.rs` → `parse_silent_witness_v2`, `backend/verifier_inputs.py`, `frontend/src/verifierInputs.ts` |
+| Registration rejects an envelope declaring a version other than `EXPECTED_CIRCUIT_VERSION` | `lib.rs` → `parse_scoped_silent_witness_public_inputs` (`CircuitVersionMismatch`, 87) |
 | Circuit tests cover tampered public inputs, swapped fields, wrong video hash, and nullifier from different video | `silent_witness/src/main.nr` → test corpus |
 | `credential_root` metadata is stored per-root so admin can audit which roots are active | `lib.rs` → `CredentialRootRecord` |
 
@@ -497,6 +517,28 @@ limitation).
    now pinned and drift-checked (`zk/browser.artifacts.manifest.json`,
    `check-coverage`), but no check yet compares a circuit's verification-key digest
    to the key the deployed verifier contract was built with.
+   #343 adds an on-chain *declared window* (`set_verifier_circuit_versions`)
+   that rejects a proof whose circuit version the active verifier was not
+   configured to check, before the verifier is invoked. The mapping from a
+   declared version number to a specific proving key remains an off-chain,
+   operator-verified artifact, so this narrows the gap but does not eliminate it.
+   #368 closes the *in-band* half of the same gap: the scoped circuit now asserts
+   a public `circuit_version` against `CURRENT_CIRCUIT_VERSION`, and `hpx-vi/2`
+   carries that field as the frame's trailing element, so the version a proof
+   claims is part of the statement it proves instead of being inferred from the
+   frame's byte length. A frame that names any other version — including a dirty
+   encoding of the version field — is rejected with `version_mismatch` (codec) or
+   `CircuitVersionMismatch` (87, on-chain), and the strict `silent_witness/v2`
+   parser refuses a truncated 224-byte frame with `length` rather than
+   reinterpreting it. The last hole of this class is now closed as well:
+   `register_anonymous_verified` used to admit the bare 224-byte scoped frame,
+   whose version stayed *inferred* from that length and so let a proof from the
+   pre-#368 (nine-parameter) circuit register. That length is now rejected with
+   `CircuitVersionMismatch` (87) before the verifier is reached, so no scoped
+   proof can skip the version commitment by omitting the trailer; provers must
+   migrate (see `MIGRATION_GUIDE.md`). What
+   remains is the digest binding described below: version *n* is not yet
+   cryptographically tied to a specific verification key.
    See [Open Risk OR-5](#or-5-circuit-artifact-version-alignment).
 
 **Severity:** Critical (OR-1 stub path). Low (verified path via `register_anonymous_verified`).
@@ -607,7 +649,11 @@ must be reconciled against on-chain data for any security-sensitive decision.
 | Nullifier set on first use, `DuplicateNullifier` on replay | T2 | `lib.rs` → `DataKey::Nullifier` |
 | Credential root allowlist with active/revoked status | T1, T8 | `lib.rs` → `add_credential_root`, `revoke_credential_root` |
 | Issuer allowlist with active/revoked status | T3 | `lib.rs` → `add_issuer`, `revoke_issuer` |
+| Bounded issuer rotation grace window (`rotate_issuer`, `is_issuer_verifiable`, expired at `grace_expires_at`, settled by `finalize_issuer_rotation`) | T3 | `lib.rs` → `rotate_issuer` |
 | External verifier contract hook (`verify_external_proof`) | T8 | `lib.rs` → `verify_external_proof` |
+| Per-call circuit-version gate before the verifier is invoked (`require_supported_circuit_version`) | T8 | `lib.rs` → `require_supported_circuit_version` |
+| Admin-only, wasm-bounded verifier circuit-version window (`set_verifier_circuit_versions`) | T8 | `lib.rs` → `set_verifier_circuit_versions` |
+| Delegated registrations bounded by the delegation's own expiry | T2, T9 | `lib.rs` → `bounded_delegated_expiry` |
 | Public input parsing with exact-length enforcement (128 bytes) | T8 | `lib.rs` → `parse_silent_witness_public_inputs` |
 | `video_hash` cross-check between public inputs and call argument | T8 | `lib.rs` → `register_anonymous_verified` |
 | Proof TTL / expiration (`set_proof_ttl`, `get_proof_status`) | T2 | `lib.rs` → `compute_expires_at`, `get_proof_status` |
@@ -652,6 +698,7 @@ must be reconciled against on-chain data for any security-sensitive decision.
 | Offline local verification — zero network calls, no storage/log writes, and never a confirmed trust decision; envelope extraction reuses the existing single stego loader (no second protocol truth) and secret-shaped envelopes are rejected up-front | T4, T5 | `offlineVerification.ts`, `useVerification.ts` |
 | Hex normalization and validation on all hash inputs | T1, T8 | `stellarEncoding.ts` → `asHex32`, `asHexBytes` |
 | `CONTRACT_NETWORK_PASSPHRASE` exported constant used by guard | T1 | `harpocratesRegistry.ts` |
+| Non-root container execution (`nginx` UID 101) with unprivileged PID path (`/tmp/nginx.pid`) and `no-new-privileges:true` | T4 | `frontend/Dockerfile`, `docker-compose.yml` |
 
 ### 7.4 Noir ZK Circuits
 
@@ -661,6 +708,8 @@ must be reconciled against on-chain data for any security-sensitive decision.
 | `assert(derived_nullifier == nullifier)` — binds nullifier to secrets + video hash | T2, T8 | `silent_witness/src/main.nr` |
 | Nullifier commits to `(credential_secret, nullifier_secret, video_hash_hi, video_hash_lo)` | T2, T5 | `silent_witness/src/main.nr` |
 | Test corpus: tampered public inputs, wrong video hash, swapped fields, cross-video nullifier | T2, T8 | `silent_witness/src/main.nr` → test functions |
+| `assert(circuit_version == CURRENT_CIRCUIT_VERSION)` — the proof carries the version of the circuit that produced it, checked in-circuit | T8, OR-5 | `silent_witness/src/main.nr` → `test_circuit_version_downgrade` |
+| The `hpx-vi/2` codec re-checks that committed version in all three verifier layers, before canonicity and identity, and a conformance corpus pins the three to one answer | T8, OR-5 | `verifier_inputs.rs` → `parse_silent_witness_v2`, `backend/verifier_inputs.py`, `frontend/src/verifierInputs.ts`, `zk/vectors/verifier_conformance_v2.json` |
 | Pinned toolchain + hermetic build + normalized digest manifest for every circuit, with a double-build check | T4, T8, OR-5 | `zk/toolchain.lock.json`, `zk/noir/scripts/reproducible-build.sh` |
 | `check-coverage` fails when a circuit in the tree is not declared in the lock, so no circuit can reach a public boundary unpinned | T4, T8, OR-5 | `zk/tools/artifact_manifest.py` → `check_coverage` |
 | Published browser ACIR is digest-pinned and, when a build target is present, required to match it | T4, T8, OR-5 | `zk/browser.artifacts.manifest.json` → `verify-browser` |
@@ -760,6 +809,32 @@ outside the reproducible-build pipeline). What remains open is the *other* half:
 nothing compares a circuit's verification-key digest to the key the deployed
 verifier contract was built with, so the alignment check is still name-based
 rather than digest-based. See `docs/zk-reproducible-builds.md`.
+
+**Further progress (#368):** the *wire* half of the alignment problem is now
+closed for the scoped circuit. `silent_witness/v2` commits the producing
+circuit's version as a public input the circuit itself asserts, so a proof can no
+longer be re-labelled to a different circuit by editing a byte length, and every
+verifier layer checks the same declared constant (`EXPECTED_CIRCUIT_VERSION`)
+against it rather than each inferring its own. `test_circuit_version_downgrade`
+and the `sw2-neg-02x` / `sw2-neg-07x` corpus cases fail if the Noir global, the
+three codecs, and the corpus drift apart. The digest half above — version *n* to
+verification-key binding — is still open and remains this risk's core.
+
+**What #368 found about that control:** the published browser pair is not a build
+of the tracked scoped sources. `frontend/public/noir/silent_witness.json` is the
+four-field `browser_v1` circuit (six ABI parameters, helper returns two fields) and
+`zk/noir/silent_witness/src/main.nr` is the scoped circuit (nine on `main`, ten
+with `circuit_version`), so `compare_published_to_targets` reports drift for both
+stems the moment a build target exists — `465e556f5904e7bc` against
+`b296e2d6a753b579` for `silent_witness`, `a141350e3c2f83fb` against `3c3dc8a7055ce312`
+for the helper. CI never sees it because `zk/noir/**/target/` is gitignored, which
+means the "required to match it" column above is inert in practice, and
+`assertArtifactPair` keeps the browser pinned to `browser_v1` by bytecode digest
+instead. Publishing a scoped browser pair means moving the main artifact, the
+helper artifact, the `artifact_abis.scoped_v2` entry and
+`zk/toolchain.lock.json`'s `published_acir` declarations together; a scoped main
+beside the four-field helper resolves to no frame at all, so a partial publish
+fails the browser closed.
 
 ---
 
@@ -1006,6 +1081,7 @@ add a one-line change summary below:
 | 1.0 | 2026-07-24 | Initial threat model. Covers all four components. Nine open risks identified. |
 | 1.1 | 2026-07-26 | Add OR-10: Threshold seal policy governance (m-of-n Public Seal). |
 | 1.2 | 2026-09-24 | Add OR-11: Unbounded external evidence fetch — resolved in #287. Connect timeout, response-size cap, and privacy-safe logging enforced via fetch_external.safe_urlopen. |
+| 1.3 | 2026-09-27 | Evidence Studio redaction preview documents the public boundary; seeds, witness values and media never render in preview or telemetry signals. |
 
 ## CI proof artifact retention
 Retained CI artifacts are a public-boundary risk. Only allowlisted proof outputs are retained, via `devx/retain_proof_artifacts.py`, which rejects media, keys, seeds, witness values and prover inputs, and never prints file names or contents. See `docs/proof-artifact-retention.md`.

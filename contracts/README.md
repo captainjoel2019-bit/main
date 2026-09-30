@@ -156,6 +156,10 @@ in the sequential branch inside `upgrade_storage`, preserve existing proof /
 video / nullifier records, and must never log media, secrets, witnesses, or
 private keys.
 
+A V1 wasm presented with a stored version greater than V1 leaves that version
+and the rest of storage untouched; it does not attempt a downgrade. Operators
+must use a wasm that supports the stored schema version.
+
 Rollback is redeploying a prior wasm: additive `SchemaVersion` keys are
 ignored by older readers, and no proof rewrite is required for the V1 stamp.
 Operators should call `get_storage_schema_version` after upgrade to confirm
@@ -248,6 +252,10 @@ get_proof
 get_by_video
 has_nullifier
 get_issuer
+rotate_issuer
+finalize_issuer_rotation
+get_issuer_rotation
+is_issuer_verifiable
 set_revocation_root
 get_revocation_root
 check_non_revocation
@@ -356,6 +364,8 @@ The registry emits typed Soroban events with `#[contractevent]`:
 ["proof", "revoke", proof_id]     => status
 ["issuer", "add", issuer]         => metadata_hash
 ["issuer", "revoke", issuer]      => {}
+["issuer", "rotate", previous_issuer] => replacement_issuer, rotated_at, grace_expires_at, grace_secs
+["issuer", "grace", issuer]       => replacement_issuer, grace_expires_at
 ["verif", "set", verifier]        => {}
 ["credroot", "add", root]         => metadata_hash, issued_at
 ["credroot", "revoke", root]      => {}
